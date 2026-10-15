@@ -1,10 +1,10 @@
-name: Backend CI/CD
+
+name: Backend CI/CD Pipeline
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
       - "backend/**"
       - ".github/workflows/backend.yml"
@@ -13,51 +13,130 @@ permissions:
   contents: read
 
 jobs:
-  build-scan-deploy:
+  build:
+    name: "01 - Build and Test"
     runs-on: ubuntu-latest
+    outputs:
+      jar_path: ${{ steps.find_jar.outputs.jar_path }}
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      - name: Set up Java 17
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: corretto
           java-version: "17"
           cache: maven
 
-      - name: Build and Test
-        working-directory: backend
-        run: mvn -B clean verify
+      - name: Check Project Files
+        run: |
+          set -eux
+          pwd
+          ls -la
+          test -f backend/pom.xml
+          echo "Project structure verified."
 
-      - name: SonarQube Analysis
+      - name: Build and Run Tests
+        working-directory: backend
+        run: |
+          set -eux
+          mvn -B clean verify
+
+      - name: Find Application JAR
+        id: find_jar
+        working-directory: backend
+        run: |
+          set -eu
+
+          JAR=$(find target -maxdepth 1 -type f \
+            -name '*.jar' \
+            ! -name '*-sources.jar' \
+            ! -name '*-javadoc.jar' \
+            ! -name 'original-*.jar' | head -n 1)
+
+          if [ -z "$JAR" ]; then
+            echo "ERROR: Application JAR not found."
+            exit 1
+          fi
+
+          echo "Found JAR: $JAR"
+          echo "jar_path=backend/$JAR" >> "$GITHUB_OUTPUT"
+
+      - name: Upload JAR Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: datastore-jar
+          path: ${{ steps.find_jar.outputs.jar_path }}
+          if-no-files-found: error
+          retention-days: 3
+
+  sonar:
+    name: "02 - SonarQube Analysis"
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: corretto
+          java-version: "17"
+          cache: maven
+
+      - name: Run SonarQube Analysis
         working-directory: backend
         env:
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
+          set -eux
+
+          test -n "$SONAR_HOST_URL"
+          test -n "$SONAR_TOKEN"
+
           mvn -B sonar:sonar \
             -Dsonar.projectKey=datastore \
             -Dsonar.projectName=datastore \
             -Dsonar.host.url="$SONAR_HOST_URL" \
             -Dsonar.token="$SONAR_TOKEN"
 
-      - name: Find JAR
-        id: jar
-        working-directory: backend
+      - name: Quality Gate
+        uses: SonarSource/sonarqube-quality-gate-action@v1.2.0
+        timeout-minutes: 10
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          scanMetadataReportFile: backend/target/sonar/report-task.txt
+
+  deploy:
+    name: "03 - Deploy to EC2"
+    runs-on: ubuntu-latest
+    needs: [build, sonar]
+    environment: development
+
+    steps:
+      - name: Download JAR Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: datastore-jar
+          path: ./deploy
+
+      - name: Verify Deployment Secrets
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_KEY: ${{ secrets.EC2_KEY }}
         run: |
-          JAR=$(find target -maxdepth 1 -type f \
-            -name '*.jar' ! -name '*-sources.jar' \
-            ! -name '*-javadoc.jar' \
-            ! -name 'original-*.jar' | head -n 1)
-
-          test -n "$JAR" || {
-            echo "No application JAR found"
-            exit 1
-          }
-
-          echo "path=backend/$JAR" >> "$GITHUB_OUTPUT"
+          set -eu
+          test -n "$EC2_HOST"
+          test -n "$EC2_USER"
+          test -n "$EC2_KEY"
+          echo "Required EC2 secrets are configured."
 
       - name: Upload JAR to EC2
         uses: appleboy/scp-action@v0.1.7
@@ -65,37 +144,44 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_KEY }}
-          source: ${{ steps.jar.outputs.path }}
-          target: /home/ec2-user/deploy/
-          strip_components: 2
+          source: "deploy/*.jar"
+          target: "/home/ec2-user/deploy/"
+          strip_components: 1
 
-      - name: Deploy Application
+      - name: Install and Start Application
         uses: appleboy/ssh-action@v1.1.0
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_KEY }}
           script: |
-            set -e
+            set -eu
 
-            sudo mkdir -p /opt/datastore
-            sudo chown ec2-user:ec2-user /opt/datastore
+            echo "Checking Java..."
+            java -version
 
+            echo "Locating uploaded JAR..."
             JAR=$(find /home/ec2-user/deploy \
-              -maxdepth 1 -name '*.jar' -type f | head -n 1)
+              -maxdepth 1 -type f -name '*.jar' | head -n 1)
 
-            test -n "$JAR"
+            if [ -z "$JAR" ]; then
+              echo "ERROR: Uploaded JAR not found."
+              exit 1
+            fi
 
-            sudo systemctl stop datastore || true
+            echo "Preparing application directory..."
+            sudo mkdir -p /opt/datastore
             sudo cp "$JAR" /opt/datastore/datastore.jar
             sudo chown ec2-user:ec2-user /opt/datastore/datastore.jar
 
+            echo "Creating systemd service..."
             sudo tee /etc/systemd/system/datastore.service > /dev/null <<'EOF'
             [Unit]
             Description=Datastore Spring Boot Application
             After=network.target
 
             [Service]
+            Type=simple
             User=ec2-user
             WorkingDirectory=/opt/datastore
             ExecStart=/usr/bin/java -jar /opt/datastore/datastore.jar --server.port=8084
@@ -106,24 +192,88 @@ jobs:
             WantedBy=multi-user.target
             EOF
 
+            echo "Restarting application..."
             sudo systemctl daemon-reload
             sudo systemctl enable datastore
             sudo systemctl restart datastore
-            sudo systemctl is-active --quiet datastore
 
-      - name: Verify Deployment
+            echo "Checking service status..."
+            sudo systemctl --no-pager --full status datastore
+
+      - name: Application Health Check
         uses: appleboy/ssh-action@v1.1.0
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_KEY }}
           script: |
-            for i in {1..12}; do
-              if curl -fsS http://localhost:8084/actuator/health; then
+            set -eu
+
+            echo "Waiting for application startup..."
+
+            for i in $(seq 1 18); do
+              if curl -fsS \
+                http://localhost:8084/actuator/health; then
+                echo ""
+                echo "SUCCESS: Health check passed."
                 exit 0
               fi
+
+              echo "Attempt $i/18 failed; retrying in 5 seconds..."
               sleep 5
             done
 
-            sudo journalctl -u datastore -n 80 --no-pager
+            echo "ERROR: Application health check failed."
+            sudo systemctl --no-pager --full status datastore || true
+            sudo journalctl -u datastore -n 100 --no-pager || true
             exit 1
+
+  report:
+    name: "04 - Pipeline Diagnostic Report"
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [build, sonar, deploy]
+
+    steps:
+      - name: Generate Visual Pipeline Summary
+        env:
+          BUILD_STATUS: ${{ needs.build.result }}
+          SONAR_STATUS: ${{ needs.sonar.result }}
+          DEPLOY_STATUS: ${{ needs.deploy.result }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          {
+            echo "# Backend CI/CD Pipeline Report"
+            echo ""
+            echo "| Stage | Result |"
+            echo "|---|---|"
+            echo "| Build and Tests | $BUILD_STATUS |"
+            echo "| SonarQube and Quality Gate | $SONAR_STATUS |"
+            echo "| EC2 Deployment and Health Check | $DEPLOY_STATUS |"
+            echo ""
+            echo "## Pipeline Flow"
+            echo ""
+            echo '```text'
+            echo "Checkout"
+            echo "   |"
+            echo "Build + Tests"
+            echo "   |"
+            echo "SonarQube + Quality Gate"
+            echo "   |"
+            echo "Upload JAR"
+            echo "   |"
+            echo "Deploy to EC2"
+            echo "   |"
+            echo "Health Check"
+            echo '```'
+            echo ""
+            echo "## Run Details"
+            echo "- Branch: $BRANCH"
+            echo "- Commit: $COMMIT"
+            echo "- Triggered by: $ACTOR"
+            echo ""
+            echo "## Troubleshooting"
+            echo "Open the failed job and expand the failed step to see its full logs."
+          } >> "$GITHUB_STEP_SUMMARY"
