@@ -1,4 +1,3 @@
-
 name: Backend CI/CD Pipeline
 
 on:
@@ -13,18 +12,43 @@ permissions:
   contents: read
 
 jobs:
+  # ==========================================
+  # 01 - Build and Test
+  # ==========================================
   build:
     name: "01 - Build and Test"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_DATABASE: mysql
+          MYSQL_USER: testuser
+          MYSQL_PASSWORD: testpassword
+          MYSQL_ROOT_PASSWORD: testrootpassword
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -ptestrootpassword"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      SPRING_DATASOURCE_URL: jdbc:mysql://127.0.0.1:3306/mysql?createDatabaseIfNotExist=true
+      SPRING_DATASOURCE_USERNAME: testuser
+      SPRING_DATASOURCE_PASSWORD: testpassword
+
     outputs:
       jar_path: ${{ steps.find_jar.outputs.jar_path }}
 
     steps:
       - name: Checkout Source Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: corretto
           java-version: "17"
@@ -40,9 +64,7 @@ jobs:
 
       - name: Build and Run Tests
         working-directory: backend
-        run: |
-          set -eux
-          mvn -B clean verify
+        run: mvn -B clean verify
 
       - name: Find Application JAR
         id: find_jar
@@ -72,21 +94,34 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  # ==========================================
+  # 02 - SonarQube and Quality Gate
+  # ==========================================
   sonar:
     name: "02 - SonarQube Analysis"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: build
 
     steps:
       - name: Checkout Source Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: corretto
           java-version: "17"
           cache: maven
+
+      - name: Verify SonarQube Secrets
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          set -eu
+          test -n "$SONAR_HOST_URL"
+          test -n "$SONAR_TOKEN"
+          echo "SonarQube secrets are configured."
 
       - name: Run SonarQube Analysis
         working-directory: backend
@@ -94,10 +129,7 @@ jobs:
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
-          set -eux
-
-          test -n "$SONAR_HOST_URL"
-          test -n "$SONAR_TOKEN"
+          set -eu
 
           mvn -B sonar:sonar \
             -Dsonar.projectKey=datastore \
@@ -113,9 +145,12 @@ jobs:
         with:
           scanMetadataReportFile: backend/target/sonar/report-task.txt
 
+  # ==========================================
+  # 03 - Deploy to EC2
+  # ==========================================
   deploy:
     name: "03 - Deploy to EC2"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [build, sonar]
     environment: development
 
@@ -131,12 +166,24 @@ jobs:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
           EC2_KEY: ${{ secrets.EC2_KEY }}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
+          MYSQL_USERNAME: ${{ secrets.MYSQL_USERNAME }}
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
         run: |
           set -eu
+
           test -n "$EC2_HOST"
           test -n "$EC2_USER"
           test -n "$EC2_KEY"
-          echo "Required EC2 secrets are configured."
+          test -n "$MYSQL_HOST"
+          test -n "$MYSQL_DATABASE"
+          test -n "$MYSQL_USERNAME"
+          test -n "$MYSQL_PASSWORD"
+
+          test -n "$(find ./deploy -maxdepth 1 -name '*.jar' -print -quit)"
+
+          echo "Deployment configuration verified."
 
       - name: Upload JAR to EC2
         uses: appleboy/scp-action@v0.1.7
@@ -150,10 +197,16 @@ jobs:
 
       - name: Install and Start Application
         uses: appleboy/ssh-action@v1.1.0
+        env:
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
+          MYSQL_USERNAME: ${{ secrets.MYSQL_USERNAME }}
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_KEY }}
+          envs: MYSQL_HOST,MYSQL_DATABASE,MYSQL_USERNAME,MYSQL_PASSWORD
           script: |
             set -eu
 
@@ -170,9 +223,22 @@ jobs:
             fi
 
             echo "Preparing application directory..."
-            sudo mkdir -p /opt/datastore
+            sudo install -d -o ec2-user -g ec2-user /opt/datastore
             sudo cp "$JAR" /opt/datastore/datastore.jar
             sudo chown ec2-user:ec2-user /opt/datastore/datastore.jar
+
+            echo "Configuring database environment..."
+            sudo install -d -o root -g ec2-user -m 750 /etc/datastore
+
+            printf 'SPRING_DATASOURCE_URL=jdbc:mysql://%s:3306/%s?createDatabaseIfNotExist=true\nSPRING_DATASOURCE_USERNAME=%s\nSPRING_DATASOURCE_PASSWORD=%s\n' \
+              "$MYSQL_HOST" \
+              "$MYSQL_DATABASE" \
+              "$MYSQL_USERNAME" \
+              "$MYSQL_PASSWORD" \
+              | sudo tee /etc/datastore/datastore.env > /dev/null
+
+            sudo chown root:ec2-user /etc/datastore/datastore.env
+            sudo chmod 640 /etc/datastore/datastore.env
 
             echo "Creating systemd service..."
             sudo tee /etc/systemd/system/datastore.service > /dev/null <<'EOF'
@@ -184,6 +250,7 @@ jobs:
             Type=simple
             User=ec2-user
             WorkingDirectory=/opt/datastore
+            EnvironmentFile=/etc/datastore/datastore.env
             ExecStart=/usr/bin/java -jar /opt/datastore/datastore.jar --server.port=8084
             Restart=on-failure
             RestartSec=5
@@ -228,9 +295,12 @@ jobs:
             sudo journalctl -u datastore -n 100 --no-pager || true
             exit 1
 
+  # ==========================================
+  # 04 - Pipeline Diagnostic Report
+  # ==========================================
   report:
     name: "04 - Pipeline Diagnostic Report"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: always()
     needs: [build, sonar, deploy]
 
@@ -243,6 +313,7 @@ jobs:
           BRANCH: ${{ github.ref_name }}
           COMMIT: ${{ github.sha }}
           ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           {
             echo "# Backend CI/CD Pipeline Report"
@@ -258,7 +329,7 @@ jobs:
             echo '```text'
             echo "Checkout"
             echo "   |"
-            echo "Build + Tests"
+            echo "Build + Tests (temporary MySQL)"
             echo "   |"
             echo "SonarQube + Quality Gate"
             echo "   |"
@@ -273,7 +344,10 @@ jobs:
             echo "- Branch: $BRANCH"
             echo "- Commit: $COMMIT"
             echo "- Triggered by: $ACTOR"
+            echo "- [View workflow run]($RUN_URL)"
             echo ""
             echo "## Troubleshooting"
-            echo "Open the failed job and expand the failed step to see its full logs."
+            echo "- If Build fails, inspect Maven test logs."
+            echo "- If SonarQube fails, verify the host, token, and Quality Gate."
+            echo "- If Deployment fails, verify SSH access, database secrets, and EC2 logs."
           } >> "$GITHUB_STEP_SUMMARY"
