@@ -97,6 +97,7 @@ jobs:
   # ==========================================
   # 02 - SonarQube and Quality Gate
   # ==========================================
+
   sonar:
     name: "02 - SonarQube Analysis"
     runs-on: ubuntu-24.04
@@ -123,6 +124,14 @@ jobs:
           test -n "$SONAR_TOKEN"
           echo "SonarQube secrets are configured."
 
+      - name: Compile Java Classes
+        working-directory: backend
+        run: |
+          set -eu
+          mvn -B -DskipTests compile
+          test -d target/classes
+          echo "Java classes compiled successfully."
+
       - name: Run SonarQube Analysis
         working-directory: backend
         env:
@@ -135,7 +144,8 @@ jobs:
             -Dsonar.projectKey=datastore \
             -Dsonar.projectName=datastore \
             -Dsonar.host.url="$SONAR_HOST_URL" \
-            -Dsonar.token="$SONAR_TOKEN"
+            -Dsonar.token="$SONAR_TOKEN" \
+            -Dsonar.java.binaries=target/classes
 
       - name: Quality Gate
         uses: SonarSource/sonarqube-quality-gate-action@v1.2.0
@@ -144,6 +154,7 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
           scanMetadataReportFile: backend/target/sonar/report-task.txt
+
 
   # ==========================================
   # 03 - Deploy to EC2
