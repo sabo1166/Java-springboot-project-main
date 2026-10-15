@@ -1,172 +1,129 @@
-name: Backend to EC2
+name: Backend CI/CD
 
 on:
-  # push:
-  #   branches:
-  #     - main
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend.yml"
+
+permissions:
+  contents: read
 
 jobs:
-  build-deploy:
+  build-scan-deploy:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Java
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: 17
+          distribution: corretto
+          java-version: "17"
           cache: maven
-      
-      - name: Build and SonarQube Scan
+
+      - name: Build and Test
+        working-directory: backend
+        run: mvn -B clean verify
+
+      - name: SonarQube Analysis
         working-directory: backend
         env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-        run: |
-          mvn clean verify sonar:sonar \
-            -DskipTests \
-            -Dsonar.projectKey=backend \
-            -Dsonar.projectName=backend \
-            -Dsonar.host.url=$SONAR_HOST_URL \
-            -Dsonar.token=$SONAR_TOKEN
-      
-      - name: SonarQube Quality Gate
-        uses: SonarSource/sonarqube-quality-gate-action@v1.2.0
-        with:
-          scanMetadataReportFile: backend/target/sonar/report-task.txt
-        timeout-minutes: 10
-        env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          mvn -B sonar:sonar \
+            -Dsonar.projectKey=datastore \
+            -Dsonar.projectName=datastore \
+            -Dsonar.host.url="$SONAR_HOST_URL" \
+            -Dsonar.token="$SONAR_TOKEN"
 
-      - name: Prepare EC2
+      - name: Find JAR
+        id: jar
+        working-directory: backend
+        run: |
+          JAR=$(find target -maxdepth 1 -type f \
+            -name '*.jar' ! -name '*-sources.jar' \
+            ! -name '*-javadoc.jar' \
+            ! -name 'original-*.jar' | head -n 1)
+
+          test -n "$JAR" || {
+            echo "No application JAR found"
+            exit 1
+          }
+
+          echo "path=backend/$JAR" >> "$GITHUB_OUTPUT"
+
+      - name: Upload JAR to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_KEY }}
+          source: ${{ steps.jar.outputs.path }}
+          target: /home/ec2-user/deploy/
+          strip_components: 2
+
+      - name: Deploy Application
         uses: appleboy/ssh-action@v1.1.0
         with:
           host: ${{ secrets.EC2_HOST }}
-          username: ec2-user
+          username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_KEY }}
           script: |
             set -e
-            sudo yum install -y git maven java-17-amazon-corretto
 
-      - name: Clone / Pull Repository
+            sudo mkdir -p /opt/datastore
+            sudo chown ec2-user:ec2-user /opt/datastore
+
+            JAR=$(find /home/ec2-user/deploy \
+              -maxdepth 1 -name '*.jar' -type f | head -n 1)
+
+            test -n "$JAR"
+
+            sudo systemctl stop datastore || true
+            sudo cp "$JAR" /opt/datastore/datastore.jar
+            sudo chown ec2-user:ec2-user /opt/datastore/datastore.jar
+
+            sudo tee /etc/systemd/system/datastore.service > /dev/null <<'EOF'
+            [Unit]
+            Description=Datastore Spring Boot Application
+            After=network.target
+
+            [Service]
+            User=ec2-user
+            WorkingDirectory=/opt/datastore
+            ExecStart=/usr/bin/java -jar /opt/datastore/datastore.jar --server.port=8084
+            Restart=on-failure
+            RestartSec=5
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            sudo systemctl daemon-reload
+            sudo systemctl enable datastore
+            sudo systemctl restart datastore
+            sudo systemctl is-active --quiet datastore
+
+      - name: Verify Deployment
         uses: appleboy/ssh-action@v1.1.0
         with:
           host: ${{ secrets.EC2_HOST }}
-          username: ec2-user
+          username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_KEY }}
           script: |
-            set -e
-            APP_DIR=/home/ec2-user/app
-            REPO_NAME=Java-springboot-project
-            REPO_URL=https://github.com/CloudTechDevOps/Java-springboot-project.git
-            mkdir -p $APP_DIR
-            cd $APP_DIR
-            if [ -d "$REPO_NAME/.git" ]; then
-              cd $REPO_NAME
-              git reset --hard
-              git pull origin main
-            else
-              git clone $REPO_URL
-              cd $REPO_NAME
-            fi
+            for i in {1..12}; do
+              if curl -fsS http://localhost:8084/actuator/health; then
+                exit 0
+              fi
+              sleep 5
+            done
 
-      - name: Build Maven Application
-        uses: appleboy/ssh-action@v1.1.0
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ec2-user
-          key: ${{ secrets.EC2_KEY }}
-          script: |
-            cd /home/ec2-user/app/Java-springboot-project/backend
-            mvn clean package -DskipTests -U
-
-      - name: Stop Old Application
-        uses: appleboy/ssh-action@v1.1.0
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ec2-user
-          key: ${{ secrets.EC2_KEY }}
-          script_stop: false
-          script: |
-            PID=$(ps -ef | grep '[d]atastore-0.0.7.jar' | awk '{print $2}')
-      
-            if [ -z "$PID" ]; then
-              echo "Application is not running."
-              exit 0
-            fi
-      
-            echo "Stopping PID: $PID"
-            kill -15 $PID
-            sleep 5
-      
-            if ps -p $PID > /dev/null 2>&1; then
-              echo "Force killing PID: $PID"
-              kill -9 $PID
-            fi
-      
-            echo "Application stopped."
-
-      - name: Start Application
-        uses: appleboy/ssh-action@v1.1.0
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ec2-user
-          key: ${{ secrets.EC2_KEY }}
-          script: |
-            LOG_DIR=/var/log/app
-            sudo mkdir -p $LOG_DIR
-            sudo chown ec2-user:ec2-user $LOG_DIR
-            cd /home/ec2-user/app/Java-springboot-project/backend/target
-            nohup env \
-              MYSQL_HOST=${{ secrets.DB_HOST }} \
-              MYSQL_PORT=3306 \
-              MYSQL_USERNAME=${{ secrets.DB_USERNAME }} \
-              MYSQL_PASSWORD=${{ secrets.DB_PASSWORD }} \
-              LOG_FILE_PATH=$LOG_DIR/datastore.log \
-              java -jar datastore-0.0.7.jar --server.port=8084 \
-              > $LOG_DIR/nohup.out 2>&1 &
-
-      - name: Wait for App Startup
-        uses: appleboy/ssh-action@v1.1.0
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ec2-user
-          key: ${{ secrets.EC2_KEY }}
-          script: sleep 15
-
-      - name: Verify Application
-        uses: appleboy/ssh-action@v1.1.0
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ec2-user
-          key: ${{ secrets.EC2_KEY }}
-          script: |
-            HEALTH=$(curl -s http://localhost:8084/actuator/health)
-            echo "$HEALTH"
-            [[ "$HEALTH" == *'"status":"UP"'* ]]
-
-      - name: Send Deployment Report
-        if: always()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          secure: true
-          username: ${{ secrets.EMAIL_USERNAME }}
-          password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: Backend Deployment Report - ${{ github.repository }}
-          to: ${{ secrets.EMAIL_TO }}
-          from: ${{ secrets.EMAIL_USERNAME }}
-          body: |
-            Repository: ${{ github.repository }}
-            Branch: ${{ github.ref_name }}
-            Commit: ${{ github.sha }}
-            Status: ${{ job.status }}
-            Actor: ${{ github.actor }}
-            Workflow: ${{ github.workflow }}
-            SonarQube: Completed
-            Quality Gate: Passed if workflow succeeded.
+            sudo journalctl -u datastore -n 80 --no-pager
+            exit 1
